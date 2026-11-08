@@ -1,0 +1,9 @@
+
+# Zig build output and package cache (every project and examples/)
+.zig-cache/
+zig-out/
+zig-pkg/
+*.ppm
+
+# Part I: quadfall high-score file (written when the game runs)
+quadfall-save.zon

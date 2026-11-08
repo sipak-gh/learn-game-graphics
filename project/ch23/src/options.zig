@@ -1,0 +1,198 @@
+const std = @import("std");
+const Vec2 = @import("math.zig").Vec2;
+const Input = @import("input.zig").Input;
+const Action = @import("input.zig").Action;
+const View = @import("app.zig").View;
+const Shading = @import("light.zig").Shading;
+const Filter = @import("texture.zig").Filter;
+const Culling = @import("visibility.zig").Culling;
+
+pub const usage =
+    \\usage: delve [OPTIONS]
+    \\
+    \\  --frames N         stop after N frames (each frame advances exactly one tick)
+    \\  --headless         render without opening a window
+    \\  --out FILE         save the last frame as FILE (.png or .ppm)
+    \\  --screenshot FILE  save a screenshot of the window as FILE (.png)
+    \\  --scale N          window pixels per canvas pixel (default 2)
+    \\  --pos X,Y          start at map position X,Y instead of the map's start
+    \\  --yaw DEG          start facing DEG degrees (0 east, 90 south)
+    \\  --pitch DEG        start looking DEG degrees up (negative: down), -85 to 85
+    \\  --hold F,S,T[,U]   hold forward, strafe, turn, look-up input (-1 to 1) all run long
+    \\  --press ACTION     perform ACTION (for example next_view) on the first tick
+    \\  --view NAME        start in view NAME: solid, depth, levels, chunks, overdraw,
+    \\                     overhead, raycast, wireframe, cube, map_fixed, map_follow
+    \\  --shading NAME     light the 3D views with NAME: unlit, flat, gouraud, phong
+    \\  --filter NAME      read textures with NAME: nearest, bilinear, mipmap, trilinear
+    \\  --culling NAME     skip chunks with NAME: off, frustum, grid (the default)
+    \\  --map NAME         play map NAME: cellar (the default), labyrinth, or a file
+    \\  --record FILE      save every tick's input to FILE, to replay it with --demo
+    \\  --demo NAME        replay demo NAME: tour, or a file from --record
+    \\  -h, --help         show this help
+    \\
+;
+
+pub const Options = struct {
+    frames: ?u32 = null,
+    headless: bool = false,
+    out: ?[]const u8 = null,
+    screenshot: ?[:0]const u8 = null,
+    scale: u32 = 2,
+    pos: ?Vec2 = null,
+    yaw: ?f32 = null,
+    pitch: ?f32 = null,
+    /// Input held down for the whole run, on top of the keyboard.
+    hold: Input = .{},
+    /// Actions to perform once, on the first tick.
+    press: std.EnumSet(Action) = .empty,
+    view: ?View = null,
+    shading: ?Shading = null,
+    filter: ?Filter = null,
+    culling: ?Culling = null,
+    map: ?[]const u8 = null,
+    record: ?[]const u8 = null,
+    demo: ?[]const u8 = null,
+    help: bool = false,
+
+    pub const Error = error{ UnknownFlag, MissingValue, InvalidValue };
+
+    /// Parses the arguments after the program name.
+    pub fn parse(args: []const [:0]const u8) Error!Options {
+        var opts: Options = .{};
+        var i: usize = 0;
+        while (i < args.len) : (i += 1) {
+            const arg = args[i];
+            if (eql(arg, "--headless")) {
+                opts.headless = true;
+            } else if (eql(arg, "-h") or eql(arg, "--help")) {
+                opts.help = true;
+            } else if (eql(arg, "--frames")) {
+                opts.frames = try parseInt(try value(args, &i));
+            } else if (eql(arg, "--out")) {
+                opts.out = try value(args, &i);
+            } else if (eql(arg, "--screenshot")) {
+                opts.screenshot = try value(args, &i);
+            } else if (eql(arg, "--scale")) {
+                opts.scale = try parseInt(try value(args, &i));
+                if (opts.scale == 0) return error.InvalidValue;
+            } else if (eql(arg, "--pos")) {
+                opts.pos = try parseFloats(2, try value(args, &i));
+            } else if (eql(arg, "--hold")) {
+                const text = try value(args, &i);
+                // The fourth number, looking up, may be left out.
+                const f = parseFloats(4, text) catch
+                    try parseFloats(3, text) ++ [1]f32{0};
+                opts.hold = .{ .forward = f[0], .strafe = f[1], .turn = f[2], .tilt = f[3] };
+            } else if (eql(arg, "--press")) {
+                const name = try value(args, &i);
+                opts.press.insert(std.meta.stringToEnum(Action, name) orelse return error.InvalidValue);
+            } else if (eql(arg, "--view")) {
+                const name = try value(args, &i);
+                opts.view = std.meta.stringToEnum(View, name) orelse return error.InvalidValue;
+            } else if (eql(arg, "--shading")) {
+                const name = try value(args, &i);
+                opts.shading = std.meta.stringToEnum(Shading, name) orelse return error.InvalidValue;
+            } else if (eql(arg, "--filter")) {
+                const name = try value(args, &i);
+                opts.filter = std.meta.stringToEnum(Filter, name) orelse return error.InvalidValue;
+            } else if (eql(arg, "--culling")) {
+                const name = try value(args, &i);
+                opts.culling = std.meta.stringToEnum(Culling, name) orelse return error.InvalidValue;
+            } else if (eql(arg, "--map")) {
+                opts.map = try value(args, &i);
+            } else if (eql(arg, "--record")) {
+                opts.record = try value(args, &i);
+            } else if (eql(arg, "--demo")) {
+                opts.demo = try value(args, &i);
+            } else if (eql(arg, "--yaw")) {
+                opts.yaw = try parseFloat(try value(args, &i));
+            } else if (eql(arg, "--pitch")) {
+                const pitch = try parseFloat(try value(args, &i));
+                // As far as the player can look (player.max_pitch).
+                if (!(@abs(pitch) <= 85)) return error.InvalidValue;
+                opts.pitch = pitch;
+            } else {
+                return error.UnknownFlag;
+            }
+        }
+        return opts;
+    }
+};
+
+fn eql(a: []const u8, b: []const u8) bool {
+    return std.mem.eql(u8, a, b);
+}
+
+/// Returns the argument after flag `args[i.*]` and moves `i` past it.
+fn value(args: []const [:0]const u8, i: *usize) Options.Error![:0]const u8 {
+    i.* += 1;
+    if (i.* >= args.len) return error.MissingValue;
+    return args[i.*];
+}
+
+fn parseInt(text: []const u8) Options.Error!u32 {
+    return std.fmt.parseInt(u32, text, 10) catch error.InvalidValue;
+}
+
+fn parseFloat(text: []const u8) Options.Error!f32 {
+    return std.fmt.parseFloat(f32, text) catch error.InvalidValue;
+}
+
+/// Parses `n` comma-separated numbers, for example "3.5,1.5".
+fn parseFloats(comptime n: usize, text: []const u8) Options.Error![n]f32 {
+    var result: [n]f32 = undefined;
+    var parts = std.mem.splitScalar(u8, text, ',');
+    for (&result) |*x| x.* = try parseFloat(parts.next() orelse return error.InvalidValue);
+    if (parts.next() != null) return error.InvalidValue;
+    return result;
+}
+
+test "parse flags and values" {
+    const opts = try Options.parse(&.{ "--headless", "--frames", "3", "--out", "a.png" });
+    try std.testing.expect(opts.headless);
+    try std.testing.expectEqual(3, opts.frames);
+    try std.testing.expectEqualStrings("a.png", opts.out.?);
+    try std.testing.expectEqual(2, opts.scale);
+
+    const pose = try Options.parse(&.{ "--pos", "3.5,-1", "--yaw", "90", "--pitch", "-20" });
+    try std.testing.expectEqual(Vec2{ 3.5, -1 }, pose.pos.?);
+    try std.testing.expectEqual(90, pose.yaw.?);
+    try std.testing.expectEqual(-20, pose.pitch.?);
+
+    const held = try Options.parse(&.{ "--hold", "1,0,-0.5" });
+    try std.testing.expectEqual(Input{ .forward = 1, .strafe = 0, .turn = -0.5 }, held.hold);
+    const looking = try Options.parse(&.{ "--hold", "0,0,0,1" });
+    try std.testing.expectEqual(Input{ .tilt = 1 }, looking.hold);
+
+    const pressed = try Options.parse(&.{ "--press", "next_view" });
+    try std.testing.expect(pressed.press.contains(.next_view));
+
+    const view = try Options.parse(&.{ "--view", "cube" });
+    try std.testing.expectEqual(.cube, view.view.?);
+    const shading = try Options.parse(&.{ "--shading", "gouraud" });
+    try std.testing.expectEqual(.gouraud, shading.shading.?);
+    const filter = try Options.parse(&.{ "--filter", "bilinear" });
+    try std.testing.expectEqual(.bilinear, filter.filter.?);
+    const culling = try Options.parse(&.{ "--culling", "frustum" });
+    try std.testing.expectEqual(.frustum, culling.culling.?);
+    const map = try Options.parse(&.{ "--map", "maps/big.txt" });
+    try std.testing.expectEqualStrings("maps/big.txt", map.map.?);
+    const demo = try Options.parse(&.{ "--record", "a.txt", "--demo", "tour" });
+    try std.testing.expectEqualStrings("a.txt", demo.record.?);
+    try std.testing.expectEqualStrings("tour", demo.demo.?);
+}
+
+test "bad arguments" {
+    try std.testing.expectError(error.UnknownFlag, Options.parse(&.{"--nope"}));
+    try std.testing.expectError(error.MissingValue, Options.parse(&.{"--frames"}));
+    try std.testing.expectError(error.InvalidValue, Options.parse(&.{ "--scale", "0" }));
+    try std.testing.expectError(error.InvalidValue, Options.parse(&.{ "--frames", "x" }));
+    try std.testing.expectError(error.InvalidValue, Options.parse(&.{ "--pos", "3" }));
+    try std.testing.expectError(error.InvalidValue, Options.parse(&.{ "--pos", "1,2,3" }));
+    try std.testing.expectError(error.InvalidValue, Options.parse(&.{ "--press", "jump" }));
+    try std.testing.expectError(error.InvalidValue, Options.parse(&.{ "--pitch", "86" }));
+    try std.testing.expectError(error.InvalidValue, Options.parse(&.{ "--hold", "1,0" }));
+    try std.testing.expectError(error.InvalidValue, Options.parse(&.{ "--view", "top" }));
+    try std.testing.expectError(error.InvalidValue, Options.parse(&.{ "--culling", "portals" }));
+    try std.testing.expectError(error.InvalidValue, Options.parse(&.{ "--filter", "cubic" }));
+}
